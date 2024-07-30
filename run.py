@@ -20,6 +20,7 @@ if __name__ == '__main__':
     embedding = 'embedding_SougouNews.npz'
     if args.embedding == 'random':
         embedding = 'random'
+        
     model_name = args.model  # 'TextRCNN'  # TextCNN, TextRNN, FastText, TextRCNN, TextRNN_Att, DPCNN, Transformer
     if model_name == 'FastText':
         from utils_fasttext import build_dataset, build_iterator, get_time_dif

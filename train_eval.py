@@ -7,6 +7,10 @@ from sklearn import metrics
 import time
 from utils import get_time_dif
 from tensorboardX import SummaryWriter
+import csv
+import os
+import glob
+import pandas as pd
 
 
 # 权重初始化，默认xavier
@@ -25,75 +29,107 @@ def init_network(model, method='xavier', exclude='embedding', seed=123):
             else:
                 pass
 
-
 def train(config, model, train_iter, dev_iter, test_iter):
     start_time = time.time()
     model.train()
     optimizer = torch.optim.Adam(model.parameters(), lr=config.learning_rate)
-
-    # 学习率指数衰减，每次epoch：学习率 = gamma * 学习率
-    # scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.9)
-    total_batch = 0  # 记录进行到多少batch
+    total_batch = 0
     dev_best_loss = float('inf')
-    last_improve = 0  # 记录上次验证集loss下降的batch数
-    flag = False  # 记录是否很久没有效果提升
-    writer = SummaryWriter(log_dir=config.log_path + '/' + time.strftime('%m-%d_%H.%M', time.localtime()))
+    last_improve = 0
+    flag = False
+
+    # 创建logs文件夹和当前训练的log文件夹
+    if not os.path.exists('logs'):
+        os.makedirs('logs')
+    
+    # 查找已有的日志文件夹数量
+    existing_logs = glob.glob('logs/log_*')
+    log_count = len(existing_logs) + 1
+    log_dir = os.path.join('logs', f'log_{log_count}')
+    os.makedirs(log_dir)
+    log_file = os.path.join(log_dir, 'metrics.csv')
+    model_save_path = os.path.join(log_dir, 'model.ckpt')
+    config.save_path = model_save_path  # 更新配置中的保存路径
+
+    # 创建CSV文件并写入表头
+    with open(log_file, mode='w', newline='') as file:
+        writer = csv.writer(file)
+        writer.writerow(['Iteration', 'Train Loss', 'Train Acc', 'Train Recall', 'Train F1',
+                         'Val Loss', 'Val Acc', 'Val Recall', 'Val F1', 'Time', 'Improved'])
+
     for epoch in range(config.num_epochs):
-        print('Epoch [{}/{}]'.format(epoch + 1, config.num_epochs))
-        # scheduler.step() # 学习率衰减
+        print(f'Epoch [{epoch + 1}/{config.num_epochs}]')
         for i, (trains, labels) in enumerate(train_iter):
             outputs = model(trains)
             model.zero_grad()
             loss = F.cross_entropy(outputs, labels)
             loss.backward()
             optimizer.step()
+
             if total_batch % 100 == 0:
-                # 每多少轮输出在训练集和验证集上的效果
                 true = labels.data.cpu()
                 predic = torch.max(outputs.data, 1)[1].cpu()
                 train_acc = metrics.accuracy_score(true, predic)
-                dev_acc, dev_loss = evaluate(config, model, dev_iter)
+                train_recall = metrics.recall_score(true, predic, average='macro')
+                train_f1 = metrics.f1_score(true, predic, average='macro')
+
+                dev_acc, dev_loss, dev_recall, dev_f1 = evaluate(config, model, dev_iter)
+
                 if dev_loss < dev_best_loss:
                     dev_best_loss = dev_loss
-                    torch.save(model.state_dict(), config.save_path)
+                    torch.save(model.state_dict(), model_save_path)
                     improve = '*'
                     last_improve = total_batch
                 else:
                     improve = ''
+                
                 time_dif = get_time_dif(start_time)
-                msg = 'Iter: {0:>6},  Train Loss: {1:>5.2},  Train Acc: {2:>6.2%},  Val Loss: {3:>5.2},  Val Acc: {4:>6.2%},  Time: {5} {6}'
-                print(msg.format(total_batch, loss.item(), train_acc, dev_loss, dev_acc, time_dif, improve))
-                writer.add_scalar("loss/train", loss.item(), total_batch)
-                writer.add_scalar("loss/dev", dev_loss, total_batch)
-                writer.add_scalar("acc/train", train_acc, total_batch)
-                writer.add_scalar("acc/dev", dev_acc, total_batch)
+                msg = f'Iter: {total_batch:>6},  Train Loss: {loss.item():>5.2},  Train Acc: {train_acc:>6.2%},  Train Recall: {train_recall:>6.2%},  Train F1: {train_f1:>6.2%},  Val Loss: {dev_loss:>5.2},  Val Acc: {dev_acc:>6.2%},  Val Recall: {dev_recall:>6.2%},  Val F1: {dev_f1:>6.2%},  Time: {time_dif} {improve}'
+                print(msg)
+
+                # 将指标写入CSV文件
+                with open(log_file, mode='a', newline='') as file:
+                    writer = csv.writer(file)
+                    writer.writerow([total_batch, loss.item(), train_acc, train_recall, train_f1,
+                                     dev_loss, dev_acc, dev_recall, dev_f1, time_dif, improve])
+
                 model.train()
             total_batch += 1
             if total_batch - last_improve > config.require_improvement:
-                # 验证集loss超过1000batch没下降，结束训练
                 print("No optimization for a long time, auto-stopping...")
                 flag = True
                 break
         if flag:
             break
-    writer.close()
-    test(config, model, test_iter)
+
+
 
 
 def test(config, model, test_iter):
-    # test
     model.load_state_dict(torch.load(config.save_path))
     model.eval()
     start_time = time.time()
-    test_acc, test_loss, test_report, test_confusion = evaluate(config, model, test_iter, test=True)
-    msg = 'Test Loss: {0:>5.2},  Test Acc: {1:>6.2%}'
-    print(msg.format(test_loss, test_acc))
+    
+    test_acc, test_loss, test_recall, test_f1, test_report, test_confusion, predictions = evaluate(config, model, test_iter, test=True)
+    
+    # 打印测试结果
+    msg = f'Test Loss: {test_loss:>5.2},  Test Acc: {test_acc:>6.2%},  Test Recall: {test_recall:>6.2%},  Test F1: {test_f1:>6.2%}'
+    print(msg)
     print("Precision, Recall and F1-Score...")
     print(test_report)
     print("Confusion Matrix...")
     print(test_confusion)
     time_dif = get_time_dif(start_time)
     print("Time usage:", time_dif)
+    
+    # 保存预测结果到CSV文件
+    log_dir = os.path.dirname(config.save_path)  # 从保存路径中获取日志文件夹路径
+    predictions_file = os.path.join(log_dir, 'test_pred.csv')
+    
+    df = pd.DataFrame(predictions, columns=['True Label', 'Predicted Label'])
+    df.to_csv(predictions_file, index=False)
+    print(f'Predictions saved to {predictions_file}')
+
 
 
 def evaluate(config, model, data_iter, test=False):
@@ -101,19 +137,30 @@ def evaluate(config, model, data_iter, test=False):
     loss_total = 0
     predict_all = np.array([], dtype=int)
     labels_all = np.array([], dtype=int)
+    predictions = []
+    
     with torch.no_grad():
         for texts, labels in data_iter:
             outputs = model(texts)
             loss = F.cross_entropy(outputs, labels)
-            loss_total += loss
+            loss_total += loss.item()  # 这里将loss转换为标量
             labels = labels.data.cpu().numpy()
             predic = torch.max(outputs.data, 1)[1].cpu().numpy()
             labels_all = np.append(labels_all, labels)
             predict_all = np.append(predict_all, predic)
+            
+            # 存储预测结果
+            if test:
+                for true_label, predicted_label in zip(labels, predic):
+                    predictions.append([true_label, predicted_label])
 
     acc = metrics.accuracy_score(labels_all, predict_all)
+    recall = metrics.recall_score(labels_all, predict_all, average='macro')
+    f1 = metrics.f1_score(labels_all, predict_all, average='macro')
+    
     if test:
         report = metrics.classification_report(labels_all, predict_all, target_names=config.class_list, digits=4)
         confusion = metrics.confusion_matrix(labels_all, predict_all)
-        return acc, loss_total / len(data_iter), report, confusion
-    return acc, loss_total / len(data_iter)
+        return acc, loss_total / len(data_iter), recall, f1, report, confusion, predictions
+    return acc, loss_total / len(data_iter), recall, f1
+
